@@ -1,0 +1,16 @@
+livekit-agents>=0.8.0
+livekit-plugins-silero
+livekit-plugins-deepgram
+livekit-plugins-cartesia
+livekit-plugins-google
+pydantic>=2.0
+python-dotenv
+fastapi
+uvicorn
+SpeechRecognition
+edge-tts
+pygame
+sounddevice
+soundfile
+pyaudio
+google-genai
