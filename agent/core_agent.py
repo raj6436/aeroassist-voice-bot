@@ -1,59 +1,58 @@
 """
 Core LiveKit Voice Agent entrypoint for AeroAssist.
-Connects real-time Audio I/O, Silero VAD, Deepgram STT, Gemini LLM, Cartesia TTS, and business tools.
+Wires real-time Audio I/O, Silero VAD, Deepgram STT, Gemini LLM, Cartesia TTS,
+and business tools together using the real LiveKit Agents 1.x
+(`livekit-agents==1.8.2`) Agent / AgentSession API.
 """
 
-import os
-import sys
 import logging
 
-# Ensure shims from agent/__init__.py are loaded
-if "livekit.agents.pipeline" not in sys.modules:
-    import agent  # noqa: F401
+from livekit.agents import Agent, AgentSession, AutoSubscribe, JobContext, WorkerOptions, cli
+from livekit.plugins import cartesia, deepgram, google, silero
 
-from livekit.agents import AutoSubscribe, JobContext, WorkerOptions, cli, llm
-from livekit.agents.pipeline import VoicePipelineAgent
-from livekit.plugins import silero, deepgram, cartesia, google
-from config.prompts import AEROASSIST_SYSTEM_PROMPT
-from agent.tools import FlightTools
 from agent.state_manager import ConversationState
+from agent.tools import FLIGHT_TOOLS
+from config.prompts import AEROASSIST_SYSTEM_PROMPT
+from config.settings import settings
 
 logger = logging.getLogger("aeroassist")
+
+
+class AeroAssistAgent(Agent):
+    """AeroAssist flight-support voice persona with its business tools attached."""
+
+    def __init__(self) -> None:
+        super().__init__(instructions=AEROASSIST_SYSTEM_PROMPT, tools=FLIGHT_TOOLS)
 
 
 async def entrypoint(ctx: JobContext):
     """
     LiveKit Agents room entrypoint.
-    Subscribes to incoming audio and orchestrates conversational pipeline.
+    Connects to the room and starts the voice pipeline (VAD -> STT -> LLM -> tools -> TTS).
     """
     logger.info(f"Connecting to room {ctx.room.name}")
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
-    # Initialize conversation state and tools
+    # Per-call conversation state, shared with the tools via AgentSession.userdata
     state = ConversationState()
-    fnc_ctx = FlightTools(state=state)
 
-    # Initial system prompt
-    initial_ctx = llm.ChatContext().append(
-        role="system",
-        text=AEROASSIST_SYSTEM_PROMPT,
-    )
-
-    # Set up the Voice Pipeline Agent
-    agent = VoicePipelineAgent(
+    # api_key is passed explicitly because livekit-plugins-google reads
+    # GOOGLE_API_KEY by default, while this project's .env / config.settings
+    # use GEMINI_API_KEY.
+    session = AgentSession[ConversationState](
         vad=silero.VAD.load(),
-        stt=deepgram.STT(language="hi"),
-        llm=google.LLM(model="gemini-2.0-flash"),
-        tts=cartesia.TTS(),
-        chat_ctx=initial_ctx,
-        fnc_ctx=fnc_ctx,
+        stt=deepgram.STT(language="hi", api_key=settings.deepgram_api_key),
+        llm=google.LLM(model="gemini-2.0-flash", api_key=settings.gemini_api_key),
+        tts=cartesia.TTS(api_key=settings.cartesia_api_key),
+        userdata=state,
     )
 
-    agent.start(ctx.room)
+    await session.start(agent=AeroAssistAgent(), room=ctx.room)
 
     # Agent greets first
-    await agent.say(
-        "Namaste! AeroAssist flight customer support mein aapka swagat hai. Main aapki kya madad kar sakti hoon? Kripya apna PNR number bataiye.",
+    await session.say(
+        "Namaste! AeroAssist flight customer support mein aapka swagat hai. "
+        "Main aapki kya madad kar sakti hoon? Kripya apna PNR number bataiye.",
         allow_interruptions=True,
     )
 
@@ -64,4 +63,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

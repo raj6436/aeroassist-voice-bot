@@ -2,13 +2,21 @@
 Unit tests for AeroAssist agent pipeline:
 - ConversationState
 - EscalationHandler
-- FlightTools
+- FlightTools (LiveKit Agents 1.x function tools)
 """
 
 import unittest
 from agent.state_manager import ConversationState
 from agent.escalation_handler import EscalationHandler
-from agent.tools import FlightTools
+from agent import tools as flight_tools
+
+
+class _FakeRunContext:
+    """Minimal stand-in for livekit.agents.RunContext, exposing only what the
+    tool functions actually read (`.userdata`)."""
+
+    def __init__(self, userdata):
+        self.userdata = userdata
 
 
 class TestConversationState(unittest.TestCase):
@@ -82,40 +90,40 @@ class TestEscalationHandler(unittest.TestCase):
         self.assertIn("check_flight_status", briefing)
 
 
-class TestFlightTools(unittest.TestCase):
-    """Test FlightTools LLM methods."""
+class TestFlightTools(unittest.IsolatedAsyncioTestCase):
+    """Test the LiveKit Agents 1.x function tools in agent/tools.py."""
 
     def setUp(self):
         self.state = ConversationState()
-        self.tools = FlightTools(state=self.state)
+        self.ctx = _FakeRunContext(self.state)
 
-    def test_lookup_booking_success(self):
-        res = self.tools.lookup_booking("6E2849")
+    async def test_lookup_booking_success(self):
+        res = await flight_tools.lookup_booking(self.ctx, "6E2849")
         self.assertIn("Rahul Sharma", res)
         self.assertIn("6E-2049", res)
         self.assertEqual(self.state.verified_pnr, "6E2849")
         self.assertEqual(len(self.state.tool_calls_made), 1)
 
-    def test_lookup_booking_not_found(self):
-        res = self.tools.lookup_booking("NONEXIST")
+    async def test_lookup_booking_not_found(self):
+        res = await flight_tools.lookup_booking(self.ctx, "NONEXIST")
         self.assertIn("Maaf kijiye", res)
 
-    def test_check_flight_status(self):
-        res = self.tools.check_flight_status("6E-2049")
+    async def test_check_flight_status(self):
+        res = await flight_tools.check_flight_status(self.ctx, "6E-2049")
         self.assertIn("6E-2049", res)
         self.assertIn("on time", res)
 
-    def test_calculate_reschedule_quote(self):
-        res = self.tools.calculate_reschedule_quote("6E2849", "6E-2051", "2026-09-22")
+    async def test_calculate_reschedule_quote(self):
+        res = await flight_tools.calculate_reschedule_quote(self.ctx, "6E2849", "6E-2051", "2026-09-22")
         self.assertIn("rupees", res)
         self.assertIn("reschedule fee", res)
 
-    def test_calculate_refund_airline_cancelled(self):
-        res = self.tools.calculate_refund("QP1102")
+    async def test_calculate_refund_airline_cancelled(self):
+        res = await flight_tools.calculate_refund(self.ctx, "QP1102")
         self.assertIn("100 percent refund", res)
 
-    def test_escalate_to_human(self):
-        res = self.tools.escalate_to_human("Customer is upset about delay")
+    async def test_escalate_to_human(self):
+        res = await flight_tools.escalate_to_human(self.ctx, "Customer is upset about delay")
         self.assertIn("transfer", res)
         self.assertTrue(self.state.escalation_triggered)
         self.assertEqual(self.state.escalation_reason, "Customer is upset about delay")
