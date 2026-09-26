@@ -42,7 +42,7 @@ async def entrypoint(ctx: JobContext):
     session = AgentSession[ConversationState](
         vad=silero.VAD.load(),
         stt=deepgram.STT(language="hi", api_key=settings.deepgram_api_key),
-        llm=google.LLM(model="gemini-2.0-flash", api_key=settings.gemini_api_key),
+        llm=google.LLM(model="gemini-3.8-flash", api_key=settings.gemini_api_key),
         tts=cartesia.TTS(api_key=settings.cartesia_api_key),
         userdata=state,
     )
