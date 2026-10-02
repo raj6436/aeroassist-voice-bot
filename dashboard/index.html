@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AeroAssist Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+<style>
+  :root { --bg:#0f1419; --card:#18202a; --line:#27323f; --text:#e6edf3; --mute:#8b98a5; --ok:#3fb950; --bad:#f85149; --acc:#4c9aff; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui,Segoe UI,sans-serif; }
+  header { padding:16px 24px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; }
+  header h1 { font-size:18px; margin:0; }
+  main { padding:20px 24px; display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); }
+  section { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; min-width:0; }
+  section.wide { grid-column:1/-1; }
+  h2 { font-size:12px; margin:0 0 10px; color:var(--mute); text-transform:uppercase; letter-spacing:.06em; }
+  .row { display:flex; justify-content:space-between; gap:12px; padding:6px 0; border-top:1px solid var(--line); }
+  .row:first-of-type { border-top:0; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:8px; background:var(--mute); }
+  .dot.ok { background:var(--ok); } .dot.bad { background:var(--bad); }
+  .mute { color:var(--mute); font-size:13px; overflow-wrap:anywhere; text-align:right; }
+  button { background:var(--acc); color:#fff; border:0; border-radius:6px; padding:8px 14px; font-size:14px; cursor:pointer; }
+  button.stop { background:var(--bad); } button:disabled { opacity:.5; cursor:default; }
+  pre { margin:0; max-height:340px; overflow:auto; font:12px/1.5 Consolas,monospace; white-space:pre-wrap; word-break:break-all; background:#0b0f14; padding:10px; border-radius:6px; }
+  .err { color:#ff7b72; } .warn { color:#d29922; }
+  small { color:var(--mute); }
+</style>
+</head>
+<body>
+<header><h1>AeroAssist Dashboard</h1><small id="stamp"></small></header>
+<main>
+  <section>
+    <h2>Talk to the agent (browser)</h2>
+    <p><button id="callBtn">Start call</button> <small id="callState">Idle - uses your microphone</small></p>
+    <small>Make sure the worker is running: <code>python run_local.py dev</code></small>
+    <div id="remote"></div>
+  </section>
+  <section><h2>Services</h2><div id="services">Checking…</div></section>
+  <section><h2>Telephony</h2><div id="telephony">Loading…</div></section>
+  <section><h2>Live rooms</h2><div id="rooms">Loading…</div></section>
+  <section class="wide"><h2>Call activity <small>(time · call · event · source file:function · input → output)</small></h2>
+    <p style="margin:0 0 8px"><select id="callFilter" style="padding:6px;border-radius:6px;border:1px solid var(--line);background:#0b0f14;color:var(--text)"><option value="">All calls</option></select></p>
+    <div style="overflow:auto;max-height:420px"><table id="events" style="width:100%;border-collapse:collapse;font-size:12px"></table></div>
+  </section>
+  <section class="wide"><h2>Agent logs <small>(logs/aeroassist.log)</small></h2><pre id="logs">Loading…</pre></section>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const j = async u => { const r = await fetch(u); if (!r.ok) throw new Error(u + ' ' + r.status); return r.json(); };
+
+async function loadStatus() {
+  try {
+    const d = await j('/api/status');
+    $('services').innerHTML = Object.entries(d.services).map(([k, v]) =>
+      `<div class="row"><span><span class="dot ${v.ok ? 'ok' : 'bad'}"></span>${esc(k)}</span><span class="mute">${esc(v.detail)}</span></div>`).join('');
+    $('telephony').innerHTML =
+      `<div class="row"><span>Inbound path</span><span class="mute">${esc(d.telephony.mode)}</span></div>` +
+      `<div class="row"><span>Outbound calling</span><span class="mute">${esc(d.telephony.outbound_calling)}</span></div>`;
+  } catch (e) { $('services').textContent = 'Error: ' + e.message; }
+}
+async function loadRooms() {
+  try {
+    const d = await j('/api/rooms');
+    $('rooms').innerHTML = d.length ? d.map(r =>
+      `<div class="row"><span>${esc(r.name)}</span><span class="mute">${r.participants.map(p => esc(p.identity + ' (' + p.kind + ')')).join('<br>')}</span></div>`).join('')
+      : '<span class="mute">No active rooms</span>';
+  } catch (e) { $('rooms').textContent = 'Error: ' + e.message; }
+}
+async function loadLogs() {
+  try {
+    const d = await j('/api/logs');
+    const el = $('logs'), stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+    el.innerHTML = d.lines.map(l => `<div class="${/ERROR|Traceback/.test(l) ? 'err' : /WARNING/.test(l) ? 'warn' : ''}">${esc(l)}</div>`).join('');
+    if (stick) el.scrollTop = el.scrollHeight;
+  } catch (e) { $('logs').textContent = 'Error: ' + e.message; }
+  $('stamp').textContent = 'updated ' + new Date().toLocaleTimeString();
+}
+
+async function loadEvents() {
+  try {
+    const sel = $('callFilter'), cur = sel.value;
+    const all = await j('/api/events?limit=1000');
+    const calls = [...new Set(all.map(e => e.call))].reverse();
+    if (sel.options.length - 1 !== calls.length) {
+      sel.innerHTML = '<option value="">All calls</option>' + calls.map(c => `<option>${esc(c)}</option>`).join('');
+      sel.value = cur;
+    }
+    const rows = (cur ? all.filter(e => e.call === cur) : all).slice(-300).reverse();
+    const color = k => ({ user_speech: '#58a6ff', agent_reply: '#3fb950', tool_call: '#d2a8ff', error: '#f85149' }[k] || 'var(--mute)');
+    $('events').innerHTML = '<tr style="color:var(--mute);text-align:left"><th>Time</th><th>Call</th><th>Event</th><th>Source</th><th>Input</th><th>Output</th></tr>' +
+      rows.map(e => `<tr style="border-top:1px solid var(--line);vertical-align:top">
+        <td style="white-space:nowrap">${esc(e.ts.slice(11, 23))}</td><td>${esc(e.call)}</td>
+        <td style="color:${color(e.kind)}">${esc(e.kind)}${e.is_error ? ' ⚠' : ''}</td>
+        <td style="white-space:nowrap"><code>${esc(e.source || '')}</code></td>
+        <td>${esc(e.input || '')}</td><td>${esc(e.output || '')}</td></tr>`).join('');
+  } catch (e) { $('events').textContent = 'Error: ' + e.message; }
+}
+$('callFilter').onchange = loadEvents;
+setInterval(loadEvents, 3000); loadEvents();
+
+let room = null;
+$('callBtn').onclick = async () => {
+  const btn = $('callBtn');
+  if (room) { room.disconnect(); return; }
+  btn.disabled = true; $('callState').textContent = 'Connecting…';
+  try {
+    const { token, url } = await j('/api/token');
+    room = new LivekitClient.Room();
+    room.on(LivekitClient.RoomEvent.TrackSubscribed, t => {
+      if (t.kind === 'audio') { const el = t.attach(); $('remote').appendChild(el); el.play().catch(() => {}); }
+    });
+    room.on(LivekitClient.RoomEvent.Disconnected, () => {
+      room = null; btn.textContent = 'Start call'; btn.className = ''; $('callState').textContent = 'Call ended'; $('remote').innerHTML = '';
+    });
+    await room.connect(url, token);
+    await room.localParticipant.setMicrophoneEnabled(true);
+    btn.textContent = 'End call'; btn.className = 'stop';
+    $('callState').textContent = 'Connected - speak to AeroAssist';
+  } catch (e) { $('callState').textContent = 'Failed: ' + e.message; room = null; }
+  btn.disabled = false;
+};
+
+loadStatus(); loadRooms(); loadLogs();
+setInterval(loadLogs, 3000); setInterval(loadRooms, 5000); setInterval(loadStatus, 60000);
+</script>
+</body>
+</html>

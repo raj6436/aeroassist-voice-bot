@@ -12,7 +12,14 @@ from dotenv import load_dotenv
 ROOT_DIR = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=ROOT_DIR / ".env")
 
-logging.basicConfig(level=logging.INFO)
+(ROOT_DIR / "logs").mkdir(exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(ROOT_DIR / "logs" / "aeroassist.log", encoding="utf-8"),
+    ],
+)
 logger = logging.getLogger("aeroassist.runner")
 
 
