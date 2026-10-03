@@ -5,10 +5,21 @@ and business tools together using the real LiveKit Agents 1.x
 (`livekit-agents==1.8.2`) Agent / AgentSession API.
 """
 
+import array
 import asyncio
 import logging
 
-from livekit.agents import Agent, AgentSession, AutoSubscribe, JobContext, WorkerOptions, cli
+from livekit import rtc
+from livekit.agents import (
+    Agent,
+    AgentSession,
+    APIStatusError,
+    AutoSubscribe,
+    JobContext,
+    WorkerOptions,
+    cli,
+)
+from livekit.agents.metrics import LLMMetrics
 from livekit.agents.voice.events import (
     AgentStateChangedEvent,
     CloseEvent,
@@ -17,9 +28,11 @@ from livekit.agents.voice.events import (
     EotPredictionEvent,
     FunctionToolsExecutedEvent,
     LLMError,
+    MetricsCollectedEvent,
     ToolExecutionUpdatedEvent,
     UserInputTranscribedEvent,
 )
+from google.genai import types as genai_types
 from livekit.plugins import cartesia, deepgram, google, silero
 
 from agent.escalation_handler import EscalationHandler
@@ -44,6 +57,113 @@ LLM_FAILURE_REPEAT_FALLBACK_LINE = "Abhi bhi technical issue aa raha hai. Kripya
 
 logger = logging.getLogger("aeroassist")
 diag_logger = logging.getLogger("aeroassist.latency_diag")
+
+
+# TEMPORARY DIAGNOSTIC INSTRUMENTATION — inbound-caller-audio investigation
+# only, remove once that investigation concludes. Uses the raw rtc.Room
+# events the LiveKit RTC SDK already fires (participant_connected,
+# track_published, track_subscribed, track_subscription_failed) rather than
+# anything AgentSession-specific, so this observes the exact same thing for
+# both the Twilio-Connector phone path and the existing browser/WebRTC path
+# with zero behavior difference between them - purely additive logging, no
+# control-flow change, no effect on VAD/STT/LLM/TTS.
+def _install_room_track_diagnostics(room) -> None:
+    def _on_participant_connected(participant) -> None:
+        diag_logger.info(
+            "[LATDIAG] participant_connected identity=%s kind=%s",
+            participant.identity, participant.kind,
+        )
+
+    def _on_track_published(publication, participant) -> None:
+        diag_logger.info(
+            "[LATDIAG] track_published participant=%s sid=%s kind=%s source=%s muted=%s",
+            participant.identity, publication.sid, publication.kind, publication.source, publication.muted,
+        )
+
+    def _on_track_subscribed(track, publication, participant) -> None:
+        diag_logger.info(
+            "[LATDIAG] track_subscribed participant=%s sid=%s kind=%s source=%s",
+            participant.identity, publication.sid, track.kind, publication.source,
+        )
+        if track.kind == rtc.TrackKind.KIND_AUDIO:
+            asyncio.create_task(_observe_audio_frames(track, participant.identity))
+
+    def _on_track_subscription_failed(participant, track_sid, error) -> None:
+        diag_logger.warning(
+            "[LATDIAG] track_subscription_failed participant=%s sid=%s error=%s",
+            participant.identity, track_sid, error,
+        )
+
+    room.on("participant_connected", _on_participant_connected)
+    room.on("track_published", _on_track_published)
+    room.on("track_subscribed", _on_track_subscribed)
+    room.on("track_subscription_failed", _on_track_subscription_failed)
+
+
+# TEMPORARY DIAGNOSTIC INSTRUMENTATION — inbound-caller-audio investigation
+# only, remove once that investigation concludes. Opens a SECOND, independent
+# rtc.AudioStream on the already-subscribed track purely to observe it.
+# Confirmed safe by reading the installed SDK's own audio_stream.py: each
+# AudioStream opens its own "owned" native stream keyed by track_handle, and
+# LiveKit's native layer fans frames out to every AudioStream registered on a
+# track - this is the same mechanism AgentSession's own separate AudioStream
+# uses to read this track, so this neither steals, delays, nor alters the
+# frames AgentSession/VAD/Deepgram actually receive. Read-only: no frame is
+# ever written back, forwarded, resampled in place, or muted - only inspected
+# for sample_rate/channels/amplitude, then discarded. Logs periodic summaries
+# (not per-frame) to avoid flooding the log.
+async def _observe_audio_frames(track: rtc.Track, participant_identity: str) -> None:
+    audio_stream = rtc.AudioStream.from_track(track=track)
+    frame_count = 0
+    nonzero_frame_count = 0
+    window_frames = 0
+    window_max_amplitude = 0
+    logged_format = False
+    try:
+        async for event in audio_stream:
+            frame = event.frame
+            frame_count += 1
+            window_frames += 1
+
+            if not logged_format:
+                logged_format = True
+                frame_duration_ms = (frame.samples_per_channel / frame.sample_rate) * 1000
+                diag_logger.info(
+                    "[LATDIAG] audio_frame_format participant=%s sample_rate=%d num_channels=%d "
+                    "samples_per_channel=%d frame_duration_ms=%.2f",
+                    participant_identity, frame.sample_rate, frame.num_channels,
+                    frame.samples_per_channel, frame_duration_ms,
+                )
+
+            samples = array.array("h")
+            samples.frombytes(bytes(frame.data))
+            frame_max_amplitude = max((abs(s) for s in samples), default=0)
+            window_max_amplitude = max(window_max_amplitude, frame_max_amplitude)
+            # -32768..32767 is the full int16 range; 50 is a small noise-floor
+            # threshold well below any real speech, chosen only to separate
+            # "silence/line noise" from "something with real signal arrived".
+            if frame_max_amplitude > 50:
+                nonzero_frame_count += 1
+
+            if window_frames >= 50:
+                diag_logger.info(
+                    "[LATDIAG] audio_frame_window participant=%s frames_total=%d "
+                    "nonzero_frames_total=%d window_max_amplitude=%d",
+                    participant_identity, frame_count, nonzero_frame_count, window_max_amplitude,
+                )
+                window_frames = 0
+                window_max_amplitude = 0
+    except Exception as e:
+        diag_logger.warning(
+            "[LATDIAG] audio_frame_observation_error participant=%s frames_total=%d error=%r",
+            participant_identity, frame_count, e,
+        )
+    finally:
+        diag_logger.info(
+            "[LATDIAG] audio_frame_stream_closed participant=%s frames_total=%d nonzero_frames_total=%d",
+            participant_identity, frame_count, nonzero_frame_count,
+        )
+        await audio_stream.aclose()
 
 
 # TEMPORARY DIAGNOSTIC INSTRUMENTATION — latency investigation only, remove
@@ -102,6 +222,51 @@ def _install_latency_diagnostics(session: AgentSession) -> None:
     session.on("tool_execution_updated", _on_tool_execution_updated)
 
 
+def _extract_llm_usage(metrics: LLMMetrics) -> dict:
+    """
+    Pull the structured usage/timing fields out of a native LLMMetrics event
+    into the plain dict shape used for diagnostic logging. Defensive against
+    any field being absent on a given SDK/provider combination - every value
+    falls back to None rather than raising, so this never breaks logging.
+    """
+    return {
+        "event": "llm_metrics",
+        "prompt_tokens": getattr(metrics, "prompt_tokens", None),
+        "completion_tokens": getattr(metrics, "completion_tokens", None),
+        "total_tokens": getattr(metrics, "total_tokens", None),
+        "ttft": getattr(metrics, "ttft", None),
+        "tokens_per_second": getattr(metrics, "tokens_per_second", None),
+        # Added alongside the thinking_level=LOW change above: reasoning_tokens
+        # is already counted inside completion_tokens, but surfacing it
+        # separately is the only way to observe from logs whether capping the
+        # thinking level actually reduced hidden "thinking" token spend.
+        "reasoning_tokens": getattr(metrics, "reasoning_tokens", None),
+    }
+
+
+# TEMPORARY DIAGNOSTIC INSTRUMENTATION — latency/token-usage investigation
+# only. ``metrics_collected`` is deprecated by the installed SDK (1.8.3) in
+# favor of ``session_usage_updated`` (session-level cumulative totals only,
+# no per-request prompt/completion token breakdown or TTFT) and
+# ``ChatMessage.metrics`` (per-turn timing, but its MetricsReport TypedDict
+# has no token-count fields at all - confirmed by reading both event classes'
+# installed source). ``metrics_collected`` is still the ONLY exposed source
+# of real per-request Gemini token counts in this version, and it is still
+# actively emitted (agent_activity.py forwards llm/stt/tts/vad metrics into
+# it) - only registering a handler prints one deprecation warning, nothing
+# is actually removed. Used here deliberately, per that constraint, rather
+# than inventing an unsupported API. Never logs secrets: LLMMetrics carries
+# token counts, timing, and a provider request_id, never prompt/response
+# text or API keys.
+def _install_llm_usage_metrics(session: AgentSession) -> None:
+    def _on_metrics_collected(ev: MetricsCollectedEvent) -> None:
+        if ev.metrics.type != "llm_metrics":
+            return
+        diag_logger.info("[LLM_METRICS] %s", _extract_llm_usage(ev.metrics))
+
+    session.on("metrics_collected", _on_metrics_collected)
+
+
 # Structured call/event logging for the operational dashboard (agent/event_log.py).
 # Read-only from the voice pipeline's perspective: every hook here only
 # observes events the AgentSession already emits and never alters session
@@ -146,6 +311,31 @@ def _install_event_logging(session: AgentSession, call: str, state: Conversation
     session.on("close", _on_close)
 
 
+def _is_quota_exceeded_error(error: LLMError) -> bool:
+    """
+    True if this LLMError's underlying exception is a Gemini HTTP 429
+    (RESOURCE_EXHAUSTED / quota or rate-limit). ``status_code`` is a public,
+    documented attribute of ``APIStatusError`` (livekit-agents==1.8.3) -
+    confirmed by reading the installed SDK source, not guessed.
+
+    NOTE on what this does NOT do: LiveKit's own internal LLM retry loop
+    (``LLMStream._main_task`` in livekit-agents core) decides whether to
+    retry purely from a per-exception ``retryable`` boolean, with no
+    per-error-type hook we can intercept - the Google plugin marks 429 as
+    ``retryable=True`` (same as a transient 503/504), so a 429 is retried
+    the same number of times (default ``max_retry=3``) before LiveKit
+    itself emits ``recoverable=False``. There is no SDK-supported way to
+    shortcut that wait for 429 specifically without either globally
+    lowering ``max_retry`` (which would also cut retries for genuinely
+    transient 503/504 errors - not done here) or speaking before the SDK
+    has given up (which risks a second, contradictory reply if a later
+    retry in the same burst succeeds - not done here either). This
+    function only classifies the failure once LiveKit has already decided
+    it is permanent, so the existing escalation timing is unchanged.
+    """
+    return isinstance(error.error, APIStatusError) and error.error.status_code == 429
+
+
 def _on_llm_permanent_failure(ev: ErrorEvent, session: AgentSession, state: ConversationState) -> None:
     """
     The LLM (Gemini) can fail permanently after LiveKit's own retries are
@@ -166,12 +356,24 @@ def _on_llm_permanent_failure(ev: ErrorEvent, session: AgentSession, state: Conv
     if not isinstance(ev.error, LLMError) or ev.error.recoverable:
         return
 
+    quota_exceeded = _is_quota_exceeded_error(ev.error)
+    diag_logger.warning(
+        "[LATDIAG] llm_permanent_failure quota_exceeded=%s status_code=%s already_escalated=%s",
+        quota_exceeded,
+        getattr(ev.error.error, "status_code", None),
+        state.escalation_triggered,
+    )
+
     if state.escalation_triggered:
         session.say(LLM_FAILURE_REPEAT_FALLBACK_LINE, allow_interruptions=True)
         return
 
     state.escalation_triggered = True
-    state.escalation_reason = "LLM permanently unavailable (technical failure after retries)"
+    state.escalation_reason = (
+        "LLM permanently unavailable (Gemini quota/rate-limit exceeded - HTTP 429)"
+        if quota_exceeded
+        else "LLM permanently unavailable (technical failure after retries)"
+    )
     state.record_tool("llm_failure_escalation", state.escalation_reason)
 
     # Spoken as ONE session.say() call, not two: two sequential calls each
@@ -219,6 +421,7 @@ async def entrypoint(ctx: JobContext):
     """
     logger.info(f"Connecting to room {ctx.room.name}")
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    _install_room_track_diagnostics(ctx.room)
 
     call = ctx.room.name
     log_event(call, "call_start", direction="inbound", output="agent joined room")
@@ -229,10 +432,25 @@ async def entrypoint(ctx: JobContext):
     # api_key is passed explicitly because livekit-plugins-google reads
     # GOOGLE_API_KEY by default, while this project's .env / config.settings
     # use GEMINI_API_KEY.
+    #
+    # thinking_level=LOW: gemini-3.8-flash defaults to an automatic (model-
+    # decided) thinking budget when this is left unset. Real-call measurements
+    # showed Gemini TTFT varying 1.6s-8.5s with NO correlation to prompt size
+    # (the smallest prompt of the call had the largest TTFT) - consistent with
+    # variable server-side "thinking" time, not prompt processing. Our tasks
+    # (PNR/flight-status/refund lookups via 5 clearly-named tools, short
+    # scripted replies) don't need deep multi-step reasoning, so capping
+    # thinking to LOW is a low-risk, one-line, fully reversible lever aimed
+    # directly at that TTFT variance. Needs a real call to confirm the actual
+    # effect - see the [LLM_METRICS] reasoning_tokens field added below.
     session = AgentSession[ConversationState](
         vad=silero.VAD.load(),
         stt=deepgram.STT(language="hi", api_key=settings.deepgram_api_key),
-        llm=google.LLM(model="gemini-3.8-flash", api_key=settings.gemini_api_key),
+        llm=google.LLM(
+            model="gemini-3.8-flash",
+            api_key=settings.gemini_api_key,
+            thinking_config=genai_types.ThinkingConfig(thinking_level=genai_types.ThinkingLevel.LOW),
+        ),
         tts=cartesia.TTS(api_key=settings.cartesia_api_key),
         userdata=state,
         # Explicit turn/interruption handling for a phone-style conversation:
@@ -252,6 +470,7 @@ async def entrypoint(ctx: JobContext):
         },
     )
     _install_latency_diagnostics(session)
+    _install_llm_usage_metrics(session)
     _install_event_logging(session, call, state)
 
     session.on("error", lambda ev: _on_llm_permanent_failure(ev, session, state))

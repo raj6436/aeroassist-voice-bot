@@ -101,10 +101,27 @@ $('callFilter').onchange = loadEvents;
 setInterval(loadEvents, 3000); loadEvents();
 
 let room = null;
+
+// TEMPORARY DIAGNOSTIC INSTRUMENTATION - browser/WebRTC microphone path only.
+// Console-only (no UI change), prefixed [AUDIO_DIAG]. Does not alter the call
+// flow below - only observes it via events/stats LiveKit already exposes.
+function adiag(label, data) {
+  console.log('[AUDIO_DIAG]', new Date().toISOString(), label, data === undefined ? '' : data);
+}
+// Registers an event handler only if that RoomEvent exists on this loaded
+// SDK build (the CDN script tag is unpinned) - never assumes an exact API
+// shape, just skips with a note if something isn't present.
+function safeOn(room, eventName, handler) {
+  const ev = LivekitClient.RoomEvent && LivekitClient.RoomEvent[eventName];
+  if (ev === undefined) { adiag('event_not_available', { eventName }); return; }
+  room.on(ev, handler);
+}
+
 $('callBtn').onclick = async () => {
   const btn = $('callBtn');
   if (room) { room.disconnect(); return; }
   btn.disabled = true; $('callState').textContent = 'Connecting…';
+  let statsTimer = null;
   try {
     const { token, url } = await j('/api/token');
     room = new LivekitClient.Room();
@@ -112,13 +129,77 @@ $('callBtn').onclick = async () => {
       if (t.kind === 'audio') { const el = t.attach(); $('remote').appendChild(el); el.play().catch(() => {}); }
     });
     room.on(LivekitClient.RoomEvent.Disconnected, () => {
+      adiag('call_disconnected');
+      if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
       room = null; btn.textContent = 'Start call'; btn.className = ''; $('callState').textContent = 'Call ended'; $('remote').innerHTML = '';
     });
+    safeOn(room, 'LocalTrackPublished', (publication) => {
+      adiag('local_track_published', { source: publication?.source, kind: publication?.kind, muted: publication?.isMuted });
+    });
+    safeOn(room, 'TrackMuted', (publication, participant) => {
+      if (participant?.isLocal) adiag('local_track_muted', { source: publication?.source });
+    });
+    safeOn(room, 'TrackUnmuted', (publication, participant) => {
+      if (participant?.isLocal) adiag('local_track_unmuted', { source: publication?.source });
+    });
+
     await room.connect(url, token);
-    await room.localParticipant.setMicrophoneEnabled(true);
+    adiag('livekit_connected');
+
+    let micPublication;
+    try {
+      micPublication = await room.localParticipant.setMicrophoneEnabled(true);
+      adiag('microphone_permission_success');
+    } catch (micErr) {
+      adiag('microphone_permission_failed', { name: micErr && micErr.name, message: micErr && micErr.message });
+      throw micErr;
+    }
+    adiag('microphone_enabled');
+
+    const pub = micPublication || [...room.localParticipant.audioTrackPublications.values()][0];
+    const track = pub && pub.track;
+    const mst = track && track.mediaStreamTrack;
+    adiag('local_track_state', {
+      exists: !!mst,
+      enabled: mst && mst.enabled,
+      muted: mst && mst.muted,
+      readyState: mst && mst.readyState,
+    });
+    adiag('livekit_publication_state', {
+      exists: !!pub,
+      source: pub && pub.source,
+      muted: pub && pub.isMuted,
+      trackState: track ? 'present' : 'absent',
+    });
+
+    if (track && typeof track.getRTCStatsReport === 'function') {
+      statsTimer = setInterval(async () => {
+        try {
+          const report = await track.getRTCStatsReport();
+          for (const stat of report.values()) {
+            if (stat.type === 'outbound-rtp' && stat.kind === 'audio') {
+              adiag('outbound_audio_rtp', {
+                packetsSent: stat.packetsSent,
+                bytesSent: stat.bytesSent,
+                timestamp: stat.timestamp,
+              });
+            }
+          }
+        } catch (statErr) {
+          adiag('stats_error', { message: statErr && statErr.message });
+        }
+      }, 2000);
+    } else {
+      adiag('stats_unavailable', { reason: 'getRTCStatsReport not supported on this track/SDK build' });
+    }
+
     btn.textContent = 'End call'; btn.className = 'stop';
     $('callState').textContent = 'Connected - speak to AeroAssist';
-  } catch (e) { $('callState').textContent = 'Failed: ' + e.message; room = null; }
+  } catch (e) {
+    adiag('call_failed', { message: e && e.message });
+    if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+    $('callState').textContent = 'Failed: ' + e.message; room = null;
+  }
   btn.disabled = false;
 };
 
